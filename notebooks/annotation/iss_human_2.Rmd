@@ -1,0 +1,231 @@
+---
+title: "Annotation of MERFISH"
+output: html_notebook
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+```{r}
+GetPagoda <- function (cm, n.cores = 30, clustering.type = "infomap", embeding.type = "tSNE", verbose=TRUE,
+                       n.pcs=100, distance="cosine", trim=5, n.odgenes=1000, graph.k=30,
+                       od.genes=NULL, clustering.resolution=2, build.graph=TRUE, var.scale=TRUE, ...) {
+  r <- pagoda2::Pagoda2$new(cm, trim=trim, n.cores=n.cores, verbose=verbose, ...)
+  if (var.scale) {
+    r$adjustVariance(plot = F, do.par = F, gam.k = 10, verbose = verbose)
+  }
+  r$calculatePcaReduction(nPcs = n.pcs, n.odgenes = n.odgenes, odgenes=od.genes, maxit = 1000, verbose=verbose, var.scale=var.scale)
+
+  if (!build.graph)
+    return(r)
+
+  r$makeKnnGraph(k = graph.k, type = "PCA", center = T, distance = distance,
+                 weight.type = "none", verbose = verbose)
+
+  for (ct in clustering.type) {
+    switch (ct,
+      infomap = r$getKnnClusters(method = igraph::infomap.community, type = "PCA", name = "infomap"),
+      multilevel = r$getKnnClusters(method = igraph::multilevel.community, type = "PCA", name = "multilevel"),
+      leiden = r$getKnnClusters(method = conos::leiden.community, type = "PCA", name = "leiden", resolution=clustering.resolution),
+      stop("Unknown clustering type: ", ct)
+    )
+  }
+
+  for (et in embeding.type) {
+    r$getEmbedding(type = "PCA", embeddingType = et, distance=distance)
+  }
+
+  return(r)
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(CellAnnotatoR)
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+library(Matrix)
+library(pbapply)
+library(garnett)
+library(readr)
+
+theme_set(theme_bw())
+
+devtools::load_all("~/mh/Copenhagen/CellAnnotatoR/")
+
+CachePath <- function(path) file.path("~/mh/spatial/SpaceJam2Analysis/cache/", path)
+DataPath <- function(path) file.path("~/mh/spatial/SpaceJam2Analysis/data/", path)
+
+marker_path <- "../markers/merfish_spatial.md"
+marker_path <- "~/mh/Copenhagen/Epilepsy19/metadata/neuron_markers.md"
+
+cm_spatial <- read.table("~/mh/spatial/SpaceJam2Analysis/output/iss_human_1/cm.tsv", 
+                         header=T, row.names="cell") %>% as.matrix() %>% as("dgCMatrix") %>% 
+   Matrix::t() %>% set_colnames(paste0("c", colnames(.)))
+
+cell_stat_df <- read_csv("~/mh/spatial/SpaceJam2Analysis/output/iss_human_1/cell_stat.csv") %>%
+  mutate(cell = paste0("c", cell))
+```
+
+```{r}
+parseMarkerFile("~/mh/Copenhagen/Epilepsy19/metadata/neuron_markers_v2.md") %>% 
+  lapply(function(x) 
+    list(expressed=intersect(x$expressed, rownames(cm_spatial)),
+         not_expressed=intersect(x$not_expressed, rownames(cm_spatial)),
+         parent=x$parent)) %>% 
+  CellAnnotatoR::markerListToMarkup(file="../../markers/iss_human_2_init.md")
+```
+
+```{r}
+qplot(cell_stat_df$n_transcripts, bins=50)
+qplot(cell_stat_df$density[cell_stat_df$density < 0.1], bins=50)
+qplot(cell_stat_df$elongation[(cell_stat_df$elongation < 15) & (cell_stat_df$elongation > 0)], bins=50)
+qplot(cell_stat_df$area)
+qplot(cell_stat_df$avg_confidence, bins=100) + xlim(0, 1)
+```
+
+```{r}
+# cell_stat_df %<>% mutate(passed_qc=((n_transcripts < 75) & (density < 0.25) & (elongation < 5) & (area < 15000)))
+cell_stat_df %<>% mutate(passed_qc=((n_transcripts < 75) & (density < 0.015) & (elongation < 5) & (elongation > 0) & (area < 20000) & (avg_confidence > 0.35)))
+
+cm_filt <- cm_spatial[, cell_stat_df$cell[cell_stat_df$passed_qc]]
+dim(cm_filt)
+```
+
+## Pagoda
+
+```{r, fig.width=12, fig.height=4}
+p2_spatial <- GetPagoda(cm_filt, n.pcs=30, od.genes=rownames(cm_filt), embeding.type=NULL, log.scale=F, 
+                        var.scale=F, min.transcripts.per.cell=3)
+p2_spatial$getEmbedding(type="PCA", embeddingType="UMAP_graph", min_dist=0.1, spread=0.5)
+p2_spatial$getKnnClusters(type="PCA", method=conos::leiden.community, resolution=8, name="leiden")
+p2_spatial$getKnnClusters(type="PCA", method=conos::leiden.community, n.iterations=10, resolution=0.5, name="leiden_lr")
+# saveRDS(p2_spatial, CachePath("merfish/p2_spatial.rds"))
+
+# p2_spatial <- readRDS(CachePath("merfish/p2_spatial.rds"))
+
+cowplot::plot_grid(
+  conos::embeddingPlot(p2_spatial$embeddings$PCA$UMAP_graph, groups=p2_spatial$clusters$PCA$leiden, shuffle.colors=T),
+  conos::embeddingPlot(p2_spatial$embeddings$PCA$UMAP_graph, groups=p2_spatial$clusters$PCA$leiden_lr, shuffle.colors=T),
+  nrow=1
+)
+```
+
+```{r}
+p_df <- cell_stat_df %>% as.data.frame() %>% set_rownames(.$cell) %>% .[rownames(p2_subs1$counts),]
+ggplot(p_df) + 
+  geom_point(aes(x=x, y=y, color=log1p(p2_subs1$counts[, "MEG3"])), size=0.001)
+```
+
+## Annotation
+
+```{r}
+cm_sp_norm <- Matrix::t(p2_spatial$misc$rawCounts) %>% 
+  normalizeTfIdfWithFeatures()
+```
+
+```{r, fig.width=10, fig.height=10}
+marker_list <- parseMarkerFile("../../markers/iss_human_2.md")
+clf_data <- getClassificationData(cm_sp_norm, marker_list, prenormalized=T)
+# ann_by_level <- assignCellsByScores(p2$graphs$PCA, clf_data, clusters=clusters)
+ann_by_level <- assignCellsByScores(NULL, clf_data, clusters=p2_spatial$clusters$PCA$leiden, max.depth=4)
+
+plotAnnotationByLevels(p2_spatial$embeddings$PCA$UMAP_graph, ann_by_level$annotation, size=0.2, font.size=c(2, 4), 
+                       shuffle.colors=T, clusters=p2_spatial$clusters$PCA$leiden)
+```
+
+```{r}
+conos::embeddingPlot(p2_spatial$embeddings$PCA$UMAP_graph, groups=p2_spatial$clusters$PCA$leiden_lr, shuffle.colors=T)
+conos::embeddingPlot(p2_spatial$embeddings$PCA$UMAP_graph, colors=Matrix::rowSums(p2_spatial$misc$rawCounts), shuffle.colors=T, show.legend=T)
+```
+
+```{r}
+de_info <- p2_spatial$getDifferentialGenes(groups=p2_spatial$clusters$PCA$leiden_lr, append.auc=T)
+de_info$`5` %>% filter(AUC > 0.6) %>% arrange(-Specificity)
+```
+
+```{r, fig.width=10, fig.height=5}
+c("PDGFRA", "ADARB2") %>% plotGeneExpression(p2_spatial$embeddings$PCA$UMAP_graph, p2_spatial$counts)
+```
+
+```{r}
+which(Matrix::colMeans(p2_spatial$misc$rawCounts > 1) > 0.05) %>% names()
+
+cat(which(Matrix::colMeans(p2_spatial$misc$rawCounts > 1) > 0.05) %>% names(), sep="\n")
+```
+
+```{r}
+c("PDGFRA") %>% plotGeneExpression(p2_spatial$embeddings$PCA$UMAP_graph, p2_spatial$counts, build.panel=F)
+```
+
+```{r}
+colnames(p2_spatial$counts) %>% sort()
+
+which(Matrix::colMeans(p2_spatial$misc$rawCounts > 1) > 0.05) %>% names() %>% 
+  plotGeneExpression(p2_spatial$embeddings$PCA$UMAP_graph, p2_spatial$counts, build.panel=F)
+```
+
+```{r, fig.width=8, fig.height=4}
+cm_subs1 <- cm_filt[, !(ann_by_level$annotation$l1[colnames(cm_filt)] %in% c("Astrocytes", "Oligodendrocytes", "Oligodendrocyte Precursors"))]
+p2_subs1 <- GetPagoda(cm_subs1, n.pcs=30, od.genes=rownames(cm_subs1), embeding.type=NULL, log.scale=F, 
+                      var.scale=F, min.transcripts.per.cell=3)
+p2_subs1$getEmbedding(type="PCA", embeddingType="UMAP_graph", min_dist=0.1, spread=0.5)
+p2_subs1$getKnnClusters(type="PCA", method=conos::leiden.community, resolution=8, name="leiden")
+p2_subs1$getKnnClusters(type="PCA", method=conos::leiden.community, n.iterations=10, resolution=0.5, name="leiden_lr")
+
+cowplot::plot_grid(
+  conos::embeddingPlot(p2_subs1$embeddings$PCA$UMAP_graph, groups=p2_subs1$clusters$PCA$leiden, shuffle.colors=T),
+  conos::embeddingPlot(p2_subs1$embeddings$PCA$UMAP_graph, groups=p2_subs1$clusters$PCA$leiden_lr, shuffle.colors=T),
+  nrow=1
+)
+```
+
+```{r}
+de_info <- p2_subs1$getDifferentialGenes(groups=p2_subs1$clusters$PCA$leiden_lr, append.auc=T)
+de_info$`2` %>% filter(AUC > 0.55) %>% arrange(-Specificity)
+```
+
+```{r}
+cat(which(Matrix::colMeans(p2_subs1$misc$rawCounts > 1) > 0.1) %>% names(), sep="\n")
+```
+
+```{r}
+# c("ENC1", "NELL2", "CELF2", "OLFM1", "SPARCL1", "KCNC2") %>% 
+c("CNTNAP2") %>% 
+  plotGeneExpression(p2_subs1$embeddings$PCA$UMAP_graph, p2_subs1$counts, build.panel=F)
+```
+
+```{r}
+cm_subs1_norm <- Matrix::t(p2_subs1$misc$rawCounts) %>% 
+  normalizeTfIdfWithFeatures()
+```
+
+```{r, fig.width=10, fig.height=10}
+marker_list <- parseMarkerFile("../../markers/iss_human_2.md")
+clf_data <- getClassificationData(cm_sp_norm, marker_list, prenormalized=T)
+# ann_by_level <- assignCellsByScores(p2$graphs$PCA, clf_data, clusters=clusters)
+ann_by_level <- assignCellsByScores(NULL, clf_data, clusters=p2_subs1$clusters$PCA$leiden, max.depth=4)
+
+plotAnnotationByLevels(p2_subs1$embeddings$PCA$UMAP_graph, ann_by_level$annotation, size=0.2, font.size=c(2, 4), 
+                       shuffle.colors=T, clusters=p2_subs1$clusters$PCA$leiden)
+```
+
+```{r}
+plotSubtypeMarkers(p2_subs1$embeddings$PCA$UMAP_graph, p2_subs1$counts, clf.data=clf_data, max.depth=1, parent.type="root", build.panel=F)
+```
+
+## Save annotation
+
+```{r}
+ann_by_level$scores$l2
+ann_by_level$annotation$l1["c1"]
+
+subtypes_per_level <- clf_data$classification.tree %>% classificationTreeToDf() %$% 
+  split(Node, PathLen) %>% setNames(paste0("l", names(.)))
+
+prob_tables_per_level <- names(subtypes_per_level) %>% 
+  lapply(function(ln) ann_by_level$scores[[ln]][, sort(subtypes_per_level[[ln]])])
+
+for (n in names(prob_tables_per_level)) {
+  write_csv(prob_tables_per_level[[n]], paste0("../../output/barista_seq/annotation/", n, ".csv"))
+}
+```
+

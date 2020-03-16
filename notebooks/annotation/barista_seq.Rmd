@@ -1,0 +1,359 @@
+---
+title: "Annotation of Barista-Seq"
+output: html_notebook
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+```{r}
+library(reticulate)
+
+use_virtualenv("pandas", required=T)
+py_config()
+
+# py_install("pandas", envname="pandas")
+```
+
+```{r}
+GetPagoda <- function (cm, n.cores = 30, clustering.type = "infomap", embeding.type = "tSNE", verbose=TRUE,
+                       n.pcs=100, distance="cosine", trim=5, n.odgenes=1000, graph.k=30,
+                       od.genes=NULL, clustering.resolution=2, build.graph=TRUE, var.scale=TRUE, ...) {
+  r <- pagoda2::Pagoda2$new(cm, trim=trim, n.cores=n.cores, verbose=verbose, ...)
+  r$adjustVariance(plot = F, do.par = F, gam.k = 10, verbose = verbose)
+  r$calculatePcaReduction(nPcs = n.pcs, n.odgenes = n.odgenes, odgenes=od.genes, maxit = 1000, verbose=verbose, var.scale=var.scale)
+
+  if (!build.graph)
+    return(r)
+
+  r$makeKnnGraph(k = graph.k, type = "PCA", center = T, distance = distance,
+                 weight.type = "none", verbose = verbose)
+
+  for (ct in clustering.type) {
+    switch (ct,
+      infomap = r$getKnnClusters(method = igraph::infomap.community, type = "PCA", name = "infomap"),
+      multilevel = r$getKnnClusters(method = igraph::multilevel.community, type = "PCA", name = "multilevel"),
+      leiden = r$getKnnClusters(method = conos::leiden.community, type = "PCA", name = "leiden", resolution=clustering.resolution),
+      stop("Unknown clustering type: ", ct)
+    )
+  }
+
+  for (et in embeding.type) {
+    r$getEmbedding(type = "PCA", embeddingType = et, distance=distance)
+  }
+
+  return(r)
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(CellAnnotatoR)
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+library(Matrix)
+library(pbapply)
+library(garnett)
+library(readr)
+library(org.Mm.eg.db)
+
+theme_set(theme_bw())
+
+devtools::load_all("~/mh/Copenhagen/CellAnnotatoR/")
+
+CachePath <- function(path) file.path("~/mh/spatial/SpaceJam2Analysis/cache/", path)
+DataPath <- function(path) file.path("~/mh/spatial/SpaceJam2Analysis/data/", path)
+  
+marker_path <- "../markers/merfish_spatial.md"
+
+cm_spatial <- read.table("~/mh/spatial/SpaceJam2Analysis/output/barista_seq/cm.tsv", 
+                         header=T, row.names="cell") %>% as.matrix() %>% as("dgCMatrix") %>% 
+   Matrix::t() %>% .[rownames(.) != "unused.2", ] %>% 
+  set_colnames(paste0("c", colnames(.)))
+
+cell_stat_df <- read_csv("~/mh/spatial/SpaceJam2Analysis/output/barista_seq/cell_stat.csv") %>%
+  mutate(cell = paste0("c", cell))
+```
+
+```{r}
+qplot(cell_stat_df$n_transcripts, bins=50)
+qplot(cell_stat_df$density, bins=50)
+qplot(cell_stat_df$elongation, bins=50)
+qplot(cell_stat_df$area)
+qplot(cell_stat_df$avg_confidence, bins=100) + xlim(0, 1)
+```
+
+```{r}
+cell_stat_df %<>% mutate(passed_qc=((n_transcripts < 300) & (density < 2.5) & (elongation < 5)))
+
+cm_filt <- cm_spatial[, cell_stat_df$cell[cell_stat_df$passed_qc]]
+dim(cm_filt)
+```
+
+## Pagoda
+
+```{r, fig.width=8, fig.height=8}
+p2_spatial <- GetPagoda(cm_filt, n.pcs=30, od.genes=rownames(cm_filt))
+p2_spatial$getKnnClusters(type="PCA", method=conos::leiden.community, resolution=8, name="leiden")
+# saveRDS(p2_spatial, CachePath("merfish/p2_spatial.rds"))
+
+# p2_spatial <- readRDS(CachePath("merfish/p2_spatial.rds"))
+
+cowplot::plot_grid(
+  conos::embeddingPlot(p2_spatial$embeddings$PCA$tSNE, groups=p2_spatial$clusters$PCA$leiden, shuffle.colors=T),
+  conos::embeddingPlot(p2_spatial$embeddings$PCA$tSNE, colors=setNames(cell_stat_df$n_transcripts, cell_stat_df$cell), shuffle.colors=T),
+  conos::embeddingPlot(p2_spatial$embeddings$PCA$tSNE, colors=setNames(cell_stat_df$avg_confidence, cell_stat_df$cell), shuffle.colors=T),
+  conos::embeddingPlot(p2_spatial$embeddings$PCA$tSNE, colors=Matrix::colSums(cm_filt > 0), shuffle.colors=T),
+  nrow=2
+)
+```
+
+## Convert markers to a proper format
+
+```{r, message=FALSE}
+markers <- DataPath("barista_seq_genes/AIBS_BaristaSEQ_NSForest_v2_maxF-scores.csv") %>% 
+  read_csv()
+markers_per_clust <- as.matrix(markers[, paste0(1:6)]) %>% 
+  substr(6, 100) %>% apply(1, function(x) x[sapply(x, nchar) > 0]) %>% 
+  setNames(markers$clusterName)
+
+hierarchy_info <- DataPath("barista_seq_genes/mouseVISp_cluster_summary.csv") %>% read_csv()
+
+type_hierarchy <- hierarchy_info %>% split(.$broad_class) %>% 
+  lapply(function(df) split(df, df$subclass)) %>% 
+  lapply(sapply, function(df) split(df$consensus_cluster, df$reference_cluster) %>% sapply(unique))
+
+clf_tree <- CellAnnotatoR::hierarchyToClassificationTree(type_hierarchy)
+
+mean(unlist(markers_per_clust) %in% rownames(cm_spatial))
+```
+
+```{r}
+marker_list <- CellAnnotatoR:::appendHierarchyBranch(type_hierarchy, "root")
+ann_merge_levels <- mergeAnnotationByLevels(names(markers_per_clust), clf_tree)
+markers_per_clust_all <- lapply(ann_merge_levels, function(ann_l)
+  split(markers_per_clust, ann_l) %>% lapply(function(x) unique(unlist(x)))) %>% 
+  Reduce(c, .)
+
+for (n in names(marker_list)) {
+  marker_list[[n]]$expressed <- markers_per_clust_all[[n]]
+}
+```
+
+
+## Annotation
+
+```{r}
+cm_sp_norm <- Matrix::t(p2_spatial$misc$rawCounts) %>% normalizeTfIdfWithFeatures()
+```
+
+```{r, fig.width=10, fig.height=10}
+marker_list <- parseMarkerFile("../../markers/barista_seq_adj.md")
+clf_data <- getClassificationData(cm_sp_norm, marker_list, prenormalized=T)
+# ann_by_level <- assignCellsByScores(p2$graphs$PCA, clf_data, clusters=clusters)
+ann_by_level <- assignCellsByScores(NULL, clf_data, clusters=p2_spatial$clusters$PCA$leiden)
+
+plotAnnotationByLevels(p2_spatial$embeddings$PCA$tSNE, ann_by_level$annotation, size=0.2, font.size=c(2, 4), 
+                       shuffle.colors=T)
+```
+
+```{r, fig.width=10, fig.height=10}
+plotSubtypeMarkers(p2_spatial$embeddings$PCA$tSNE, p2_spatial$counts, clf.data=clf_data, 
+                   max.depth=1, size=0.1, parent="root")
+```
+
+### Save annotation
+
+```{r}
+subtypes_per_level <- clf_data$classification.tree %>% classificationTreeToDf() %$% 
+  split(Node, PathLen) %>% setNames(paste0("l", names(.)))
+
+prob_tables_per_level <- names(subtypes_per_level) %>% setNames(., .) %>% 
+  lapply(function(ln) ann_by_level$scores[[ln]][, sort(subtypes_per_level[[ln]])])
+
+for (n in names(prob_tables_per_level)) {
+  write_csv(round(prob_tables_per_level[[n]], 4), paste0("../../output/barista_seq_annotation/", n, ".csv"))
+}
+```
+
+## Spots
+
+```{r}
+pd <- import("pandas")
+
+cm <- pd$read_pickle("../../data/barista_seq_genes/viktor_normalized_vectors.pkl")
+spot_gene_names <- cm[[1]]
+cm <- cm[[2]] %>% set_colnames(spot_gene_names)
+cm[cm < 0] <- 0
+rownames(cm) <- paste0("c", 1:nrow(cm))
+cm %<>% Matrix::t() %>% as("dgCMatrix")
+```
+
+```{r}
+p2_spot <- GetPagoda(cm, n.pcs=30, modelType="raw", embeding.type=NULL, clustering.type=NULL, var.scale=F)
+p2_spot$getEmbedding(type="PCA", embeddingType="UMAP_graph", min_dist=0.1, spread=0.5)
+p2_spot$getKnnClusters(type="PCA", method=conos::leiden.community, resolution=8, name="leiden")
+
+conos::embeddingPlot(p2_spot$embeddings$PCA$UMAP_graph, groups=p2_spot$clusters$PCA$leiden)
+```
+
+```{r}
+cm_spot_norm <- Matrix::t(p2_spot$misc$rawCounts) %>% normalizeTfIdfWithFeatures()
+```
+
+```{r, fig.width=10, fig.height=10}
+marker_list <- parseMarkerFile("../../markers/barista_seq_adj.md")
+clf_data <- getClassificationData(cm_spot_norm, marker_list, prenormalized=T)
+# ann_by_level <- assignCellsByScores(p2$graphs$PCA, clf_data, clusters=clusters)
+ann_by_level <- assignCellsByScores(NULL, clf_data, clusters=p2_spot$clusters$PCA$leiden)
+
+plotAnnotationByLevels(p2_spot$embeddings$PCA$UMAP_graph, ann_by_level$annotation, size=0.2, font.size=c(2, 4), 
+                       shuffle.colors=T)
+```
+
+```{r}
+# as_tibble(ann_by_level$annotation) %>% write_csv("../../output/barista_seq_annotation/spot_annot.csv")
+```
+
+### Full spot table
+
+```{r}
+full_spot_data <- pd$read_pickle("../../data/barista_seq_genes/viktor/viktor_vector_fields.pkl")
+annot_mat <- as(full_spot_data[[3]][,,1] + 1, "dgCMatrix") %>% drop0()
+
+cm_full <- pblapply(1:1500, function(i) full_spot_data[[2]][i,,1,]) %>% 
+  lapply(as.data.frame) %>% data.table::rbindlist() %>% as.data.frame() %>% 
+  as.matrix() %>% as("dgCMatrix") %>% set_colnames(spot_gene_names) %>% Matrix::t()
+cm_full@x[cm_full@x < 0] <- 0
+cm_full %<>% drop0()
+
+cm_full_raw <- pblapply(1:1500, function(i) full_spot_data[[1]][i,,1,]) %>% 
+  lapply(as.data.frame) %>% data.table::rbindlist() %>% as.data.frame() %>% 
+  as.matrix() %>% as("dgCMatrix") %>% set_colnames(spot_gene_names) %>% Matrix::t()
+
+spot_info <- tibble(x=rep(1:1500, 1500), y=rep(1:1500, each=1500),) %>% 
+  mutate(is_noise=(Matrix::colSums(cm_full_raw) < 0.9))
+
+sum(!spot_info$is_noise)
+
+ggplot(filter(spot_info, !is_noise)) + 
+  geom_point(aes(x=x, y=y), size=0.01) +
+  scale_x_continuous(expand=c(0, 0)) +
+  scale_y_continuous(expand=c(0, 0))
+
+# 1: unnorm
+# 2: norm
+# 3: annot
+```
+
+```{r}
+cm_filt <- cm_full[,!spot_info$is_noise]
+cm_filt_raw <- cm_full_raw[,!spot_info$is_noise]
+
+colnames(cm_filt) <- paste0("c", 1:ncol(cm_filt))
+colnames(cm_filt_raw) <- paste0("c", 1:ncol(cm_filt_raw))
+
+cm_filt_raw <- Matrix::t(Matrix::t(cm_filt_raw) / Matrix::colSums(cm_filt_raw))
+```
+
+```{r}
+p2_spot_nn <- GetPagoda(cm_filt_raw, n.pcs=30, modelType="raw", embeding.type=NULL, clustering.type=NULL, var.scale=F)
+p2_spot_nn$getEmbedding(type="PCA", embeddingType="UMAP_graph", min_dist=0.1, spread=0.5)
+# p2_spot_nn$getKnnClusters(type="PCA", method=conos::leiden.community, resolution=8, name="leiden")
+p2_spot_nn$getKnnClusters(type="PCA", method=conos::leiden.community, n.iterations=4, resolution=8, name="leiden")
+p2_spot_nn$getKnnClusters(type="PCA", method=conos::leiden.community, n.iterations=8, resolution=2.5, name="leiden_lr")
+
+conos::embeddingPlot(p2_spot_nn$embeddings$PCA$UMAP_graph, groups=p2_spot_nn$clusters$PCA$leiden_lr, size=0.1)
+```
+
+```{r}
+# cm_spot_f_norm <- Matrix::t(p2_spot_full$misc$rawCounts) %>% normalizeTfIdfWithFeatures()
+cm_spot_f_norm <- Matrix::t(p2_spot_nn$misc$rawCounts) %>% normalizeTfIdfWithFeatures()
+```
+
+```{r}
+cell_subset <- sample(rownames(cm_spot_f_norm), replace=F, size=20000)
+```
+
+```{r}
+# cell_subset <- sample(rownames(cm_spot_f_norm), replace=F, size=50000)
+# 
+t0 <- proc.time()
+# # clf_data <- getClassificationData(cm_spot_f_norm[cell_subset,], marker_list, prenormalized=T)
+clf_data <- getClassificationData(cm_spot_f_norm, marker_list, prenormalized=T)
+# # ann_by_level <- assignCellsByScores(NULL, clf_data, clusters=p2_spot_nn$clusters$PCA$leiden[cell_subset], max.depth=1)
+ann_by_level <- assignCellsByScores(NULL, clf_data, clusters=p2_spot_nn$clusters$PCA$leiden_lr, n.cores=30)
+
+proc.time() - t0
+```
+
+```{r}
+marker_list <- parseMarkerFile("../../markers/barista_seq_adj.md")
+
+t0 <- proc.time()
+clf_data <- getClassificationData(cm_spot_f_norm, marker_list, prenormalized=T)
+ann_by_level <- assignCellsByScores(p2_spot_nn$graphs$PCA, clf_data, clusters=p2_spot_nn$clusters$PCA$leiden_lr, n.cores=30)
+
+proc.time() - t0
+```
+
+```{r}
+table(ann_by_level$annotation$l2)
+```
+
+```{r, fig.width=10, fig.height=10}
+plotAnnotationByLevels(p2_spot_nn$embeddings$PCA$UMAP_graph[cell_subset,], ann_by_level$annotation, size=0.2, font.size=c(2, 4), 
+                       shuffle.colors=T)
+```
+
+```{r}
+# t_annot <- setNames((coord_df$x < 700) & (coord_df$y > 1200), rownames(coord_df))
+# t_annot <- t_annot & (ann_by_level$annotation$l2[names(t_annot)] == "L5 IT")
+# conos::embeddingPlot(p2_spot_nn$embeddings$PCA$UMAP_graph[cell_subset,], groups=t_annot, plot.na=F, show.ticks=T)
+# conos::embeddingPlot(p2_spot_full$embeddings$PCA$UMAP_graph[cell_subset,], groups=t_annot, plot.na=F, show.ticks=T)
+```
+
+```{r, fig.width=7, fig.height=7}
+coord_df <- spot_info[!spot_info$is_noise, c("x","y")] %>% as.data.frame() %>% 
+  set_rownames(colnames(cm_filt_raw))
+conos::embeddingPlot(coord_df, groups=ann_by_level$annotation$l3[ann_by_level$annotation$l1 == "Ex"], 
+                     plot.na=F, show.legend=T, legend.pos=c(1, 0), font.size=c(4, 6)) +
+  scale_x_continuous(expand=c(0, 0)) + scale_y_continuous(expand=c(0, 0))
+```
+
+```{r}
+ann_by_level$annotation$l2[which(p2_spot_nn$clusters$PCA$leiden_lr == "35")] %>% table()
+```
+
+```{r, fig.width=10, fig.height=10}
+plotSubtypeMarkers(p2_spot_nn$embeddings$PCA$UMAP_graph[cell_subset, ], p2_spot_nn$counts[cell_subset, ], clf.data=clf_data, 
+                   max.depth=1, size=0.1, parent="root")
+
+plotSubtypeMarkers(p2_spot_nn$embeddings$PCA$UMAP_graph[cell_subset, ], p2_spot_nn$counts[cell_subset, ], clf.data=clf_data, 
+                   max.depth=1, size=0.1, parent="Inh")
+```
+
+```{r, fig.width=10, fig.height=5}
+c("Fezf2", "Sncg") %>% 
+  plotGeneExpression(p2_spot_nn$embeddings$PCA$UMAP_graph[cell_subset, ], p2_spot_nn$counts[cell_subset, ])
+```
+
+```{r, fig.width=10, fig.height=5}
+c("Tesc", "Penk", "Igfbp6", "Cnr1") %>% 
+  plotGeneExpression(p2_spot_full$embeddings$PCA$UMAP_graph[cell_subset, ], p2_spot_full$counts[cell_subset, ])
+```
+
+```{r}
+de_info <- p2_spot_full$getDifferentialGenes(groups=p2_spot_full$clusters$PCA$leiden_lr)
+
+de_info$`16` %>% arrange(-Specificity) %>% filter(ExpressionFraction > 0.2)
+```
+
+```{r}
+sort(rownames(cm_filt))
+```
+
+### Save annotation
+
+```{r}
+coord_df %>% cbind(as.data.frame(ann_by_level$annotation)) %>% 
+  write_csv("../../output/barista_seq_annotation/annotat_ssam_spots.csv")
+```

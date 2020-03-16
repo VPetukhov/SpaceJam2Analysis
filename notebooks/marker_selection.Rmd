@@ -1,0 +1,186 @@
+---
+title: "Annotation of osm-FISH"
+output: html_notebook
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+```{r, message=FALSE, warning=FALSE}
+# library(Epilepsy19)
+library(CellAnnotatoR)
+library(ggplot2)
+library(magrittr)
+library(Matrix)
+library(pbapply)
+library(tidyverse)
+library(loomR)
+
+theme_set(theme_bw())
+devtools::load_all("~/mh/Copenhagen/CellAnnotatoR/")
+```
+
+```{r}
+CachePath <- function(path) file.path("~/mh/spatial/SpaceJam2Analysis/cache/", path)
+DataPath <- function(path) file.path("~/mh/spatial/SpaceJam2Analysis/data/", path)
+```
+
+```{r, message=FALSE}
+annotation_info <- DataPath("barista_seq_genes/mouseVISp_cluster_summary.csv") %>% read_csv() %>% 
+  rename(l1=broad_class, l2=subclass, l3=reference_cluster, l4=consensus_cluster) %>% 
+  select(sample_name, l1, l2, l3, l4)
+
+annotation_info$l3[annotation_info$l3 == "Meis2"] <- "Meis2.l3"
+annotation_info$l2[annotation_info$l2 == "Endo"] <- "Endo.l2"
+
+hierarchy_info <- annotation_info %>% group_by(l1, l2, l3, l4) %>% 
+  summarise(n=n()) %>% filter(n > 4)
+
+type_hierarchy <- hierarchy_info %>% split(.$l1) %>% 
+  lapply(function(df) split(df, df$l2)) %>% 
+  lapply(sapply, function(df) split(df$l4, df$l3))
+
+clf_tree <- hierarchyToClassificationTree(type_hierarchy)
+
+cm <- data.table::fread(DataPath("mouse_ctx_exon_counts.csv"))
+cm <- as.data.frame(cm)[, annotation_info$sample_name] %>% 
+  set_rownames(cm$V1) %>% as.matrix() %>% as("dgCMatrix")
+```
+
+## Pagoda
+
+```{r}
+p2 <- GetPagoda(cm, clustering.type=NULL, embeding.type=NULL)
+
+p2$getEmbedding(type="PCA", embeddingType="UMAP", distance="cosine", min_dist=0.5, spread=1.5)
+
+conos::embeddingPlot(p2$embeddings$PCA$UMAP, groups=setNames(annotation_info$l3, annotation_info$sample_name), 
+                     shuffle.colors=T, font.size=c(2, 3))
+```
+
+
+```{r}
+cm_tfidf <- normalizeTfIdfWithFeatures(cm)
+```
+
+## Marker selection
+
+```{r}
+annotation_info[, "l0"] <- "root"
+ann_by_parent <- lapply(0:3, function(i) 
+  split(setNames(annotation_info[[paste0("l", i+1)]], annotation_info$sample_name), annotation_info[[paste0("l", i)]])) %>% 
+  Reduce(c, .) %>% .[sapply(., length) > 5]
+```
+
+```{r}
+de_info_per_parent <- ann_by_parent %>% 
+  pblapply(function(ann) p2$getDifferentialGenes(groups=ann, z.threshold=0, append.specificity.metrics=F))
+```
+
+```{r}
+pre_selected_markers <- de_info_per_parent %>% lapply(function(dfs)
+  list(
+    positive=lapply(dfs, function(df) as.character(df$Gene[df$Z > 0.1])),
+    negative=lapply(dfs, function(df) as.character(df$Gene[df$Z < -0.1]))
+  )
+)
+```
+
+## Barista-seq
+
+```{r, message=FALSE, warning=FALSE}
+barista_seq_genes <- read_csv(DataPath("barista_seq_genes/BARISTASEQ_genes.csv"))$gene %>% sort()
+
+barista_seq_pre_markers <- pre_selected_markers %>% 
+  lapply(lapply, lapply, intersect, barista_seq_genes) %>% 
+  lapply(lapply, function(x) x[sapply(x, length) > 0]) %>% 
+  lapply(function(x) x[sapply(x, length) > 0]) %>% .[sapply(., length) > 0] %>% 
+  .[sapply(., function(x) !is.null(x$positive))]
+```
+
+```{r}
+marker_info <- names(barista_seq_pre_markers) %>% setNames(., .) %>% lapply(function(n)
+  selectMarkersPerType(cm_tfidf, ann_by_parent[[n]], barista_seq_pre_markers[[n]], 
+                       parent=n, max.iters=30, max.pos.markers=5, max.uncertainty=0.25, 
+                       log.step=5, verbose=1, n.cores=1))
+```
+
+```{r}
+marker_list <- setNames(marker_info, NULL) %>% unlist(recursive=F) %>% 
+  .[sapply(., function(x) length(x$expressed)) > 0]
+
+for (i in 1:100) {
+  has_parent <- sapply(marker_list, function(x) (x$parent %in% names(marker_list)) || (x$parent == "root"))
+  if (all(has_parent)) break
+  marker_list <- marker_list[has_parent]
+}
+
+markerListToMarkup(marker_list, file="../markers/barista_seq.md") %>% 
+  parseMarkerFile() %>% createClassificationTree() %>% invisible()
+```
+
+## ISS Mouse 1
+
+```{r, message=FALSE}
+iss_m2_genes <- read_delim("../output/iss_mouse_2/cm.tsv", delim="\t") %>% 
+  colnames() %>% .[2:length(.)]
+
+iss_m2_pre_markers <- pre_selected_markers %>% 
+  lapply(lapply, lapply, intersect, iss_m2_genes) %>% 
+  lapply(lapply, function(x) x[sapply(x, length) > 0]) %>% 
+  lapply(function(x) x[sapply(x, length) > 0]) %>% .[sapply(., length) > 0] %>% 
+  .[sapply(., function(x) !is.null(x$positive))]
+```
+
+```{r}
+marker_info_iss_m2 <- names(iss_m2_pre_markers) %>% setNames(., .) %>% lapply(function(n)
+  selectMarkersPerType(cm_tfidf, ann_by_parent[[n]], iss_m2_pre_markers[[n]], 
+                       parent=n, max.iters=30, max.pos.markers=5, max.uncertainty=0.25, 
+                       log.step=5, verbose=1, n.cores=1))
+```
+
+```{r}
+marker_list_iss_m2 <- setNames(marker_info_iss_m2, NULL) %>% unlist(recursive=F) %>% 
+  .[sapply(., function(x) length(x$expressed)) > 0]
+
+for (i in 1:100) {
+  has_parent <- sapply(marker_list_iss_m2, function(x) (x$parent %in% names(marker_list_iss_m2)) || (x$parent == "root"))
+  if (all(has_parent)) break
+  marker_list_iss_m2 <- marker_list_iss_m2[has_parent]
+}
+
+markerListToMarkup(marker_list_iss_m2, file="../markers/iss_m2.md") %>% 
+  parseMarkerFile() %>% createClassificationTree() %>% invisible()
+```
+
+## DARTFISH
+
+```{r, message=FALSE}
+dartfish_genes <- read_delim("../output/dartfish_mouse/cm.tsv", delim="\t") %>% 
+  colnames() %>% .[2:length(.)]
+
+dartfish_pre_markers <- pre_selected_markers %>% 
+  lapply(lapply, lapply, intersect, dartfish_genes) %>% 
+  lapply(lapply, function(x) x[sapply(x, length) > 0]) %>% 
+  lapply(function(x) x[sapply(x, length) > 0]) %>% .[sapply(., length) > 0] %>% 
+  .[sapply(., function(x) !is.null(x$positive))]
+```
+
+```{r}
+marker_info_dartfish <- names(dartfish_pre_markers) %>% setNames(., .) %>% lapply(function(n)
+  selectMarkersPerType(cm_tfidf, ann_by_parent[[n]], dartfish_pre_markers[[n]], 
+                       parent=n, max.iters=30, max.pos.markers=5, max.uncertainty=0.25, 
+                       log.step=5, verbose=1, n.cores=1))
+```
+
+```{r}
+marker_list_dartfish <- setNames(marker_info_dartfish, NULL) %>% unlist(recursive=F) %>% 
+  .[sapply(., function(x) length(x$expressed)) > 0]
+
+for (i in 1:100) {
+  has_parent <- sapply(marker_list_dartfish, function(x) (x$parent %in% names(marker_list_dartfish)) || (x$parent == "root"))
+  if (all(has_parent)) break
+  marker_list_dartfish <- marker_list_dartfish[has_parent]
+}
+
+markerListToMarkup(marker_list_dartfish, file="../markers/dartfish_mouse.md") %>% 
+  parseMarkerFile() %>% createClassificationTree() %>% invisible()
+```

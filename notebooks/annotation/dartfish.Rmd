@@ -1,0 +1,224 @@
+---
+title: "Annotation of MERFISH"
+output: html_notebook
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+```{r}
+GetPagoda <- function (cm, n.cores = 30, clustering.type = "infomap", embeding.type = "tSNE", verbose=TRUE,
+                       n.pcs=100, distance="cosine", trim=5, n.odgenes=1000, graph.k=30,
+                       od.genes=NULL, clustering.resolution=2, build.graph=TRUE, var.scale=TRUE, ...) {
+  r <- pagoda2::Pagoda2$new(cm, trim=trim, n.cores=n.cores, verbose=verbose, ...)
+  r$adjustVariance(plot = F, do.par = F, gam.k = 10, verbose = verbose)
+  r$calculatePcaReduction(nPcs = n.pcs, n.odgenes = n.odgenes, odgenes=od.genes, maxit = 1000, verbose=verbose, var.scale=var.scale)
+
+  if (!build.graph)
+    return(r)
+
+  r$makeKnnGraph(k = graph.k, type = "PCA", center = T, distance = distance,
+                 weight.type = "none", verbose = verbose)
+
+  for (ct in clustering.type) {
+    switch (ct,
+      infomap = r$getKnnClusters(method = igraph::infomap.community, type = "PCA", name = "infomap"),
+      multilevel = r$getKnnClusters(method = igraph::multilevel.community, type = "PCA", name = "multilevel"),
+      leiden = r$getKnnClusters(method = conos::leiden.community, type = "PCA", name = "leiden", resolution=clustering.resolution),
+      stop("Unknown clustering type: ", ct)
+    )
+  }
+
+  for (et in embeding.type) {
+    r$getEmbedding(type = "PCA", embeddingType = et, distance=distance)
+  }
+
+  return(r)
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+# library(CellAnnotatoR)
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+library(Matrix)
+library(pbapply)
+library(garnett)
+library(readr)
+
+theme_set(theme_bw())
+
+devtools::load_all("~/mh/Copenhagen/CellAnnotatoR/")
+
+rootPath <- function(...) file.path("~/mh/spatial/SpaceJam2Analysis/", ...)
+  
+cm_spatial <- rootPath("output/dartfish_mouse/cm.tsv") %>% read.table(header=T, row.names="cell") %>% 
+  as.matrix() %>% as("dgCMatrix") %>% Matrix::t() %>% 
+  set_colnames(paste0("c", colnames(.)))
+
+cell_stat_df <- rootPath("output/dartfish_mouse/cell_stat.csv") %>% read_csv() %>% 
+  mutate(cell = paste0("c", cell))
+```
+
+```{r}
+qplot(cell_stat_df$n_transcripts, bins=50)
+qplot(cell_stat_df$density, bins=50)
+qplot(cell_stat_df$elongation[cell_stat_df$elongation < 100], bins=50)
+qplot(cell_stat_df$area)
+qplot(cell_stat_df$avg_confidence, bins=100) + xlim(0, 1)
+```
+
+```{r}
+cell_stat_df %<>% mutate(passed_qc=((n_transcripts >= 5) & (density < 0.2) & (elongation < 7)))
+
+cm_filt <- cm_spatial[, cell_stat_df$cell[cell_stat_df$passed_qc]]
+dim(cm_filt)
+
+rownames(cm_spatial)
+```
+
+## Pagoda
+
+```{r, fig.width=12, fig.height=4}
+p2_spatial <- GetPagoda(cm_filt, n.pcs=30, od.genes=rownames(cm_filt))
+p2_spatial$getKnnClusters(type="PCA", method=conos::leiden.community, resolution=2, name="leiden")
+clusters <- p2_spatial$clusters$PCA$leiden
+
+cowplot::plot_grid(
+  conos::embeddingPlot(p2_spatial$embeddings$PCA$tSNE, groups=clusters, shuffle.colors=T),
+  conos::embeddingPlot(p2_spatial$embeddings$PCA$tSNE, colors=setNames(cell_stat_df$n_transcripts, cell_stat_df$cell), shuffle.colors=T),
+  conos::embeddingPlot(p2_spatial$embeddings$PCA$tSNE, colors=setNames(cell_stat_df$avg_confidence, cell_stat_df$cell), shuffle.colors=T),
+  nrow=1
+)
+```
+
+## Annotation
+
+```{r}
+cm_sp_norm <- Matrix::t(p2_spatial$misc$rawCounts) %>% normalizeTfIdfWithFeatures()
+```
+
+```{r}
+marker_path <- rootPath("markers/dartfish_mouse.md")
+clf_data <- getClassificationData(cm_sp_norm, marker_path, prenormalized=T)
+# ann_by_level <- assignCellsByScores(p2$graphs$PCA, clf_data, clusters=clusters)
+ann_by_level <- assignCellsByScores(p2_spatial$graphs$PCA, clf_data, clusters=p2_spatial$clusters$PCA$leiden)
+
+plotAnnotationByLevels(p2_spatial$embeddings$PCA$tSNE, ann_by_level$annotation, size=0.2, font.size=c(2, 4), 
+                       shuffle.colors=T)
+```
+
+```{r, fig.width=5, fig.height=5}
+plotSubtypeMarkers(p2_spatial$embeddings$PCA$tSNE, p2_spatial$counts, clf.data=clf_data, 
+                   max.depth=1, build.panel=F)
+```
+
+## scRNA-seq data
+
+```{r}
+# cm_path <- "~/mh/spatial/CellSegmentation/data/merfish_moffit/scrna_seq"
+# 
+# cm <- Matrix::readMM(file.path(cm_path, "matrix.mtx")) %>% as("dgCMatrix") %>% 
+#   set_colnames(read.table(file.path(cm_path, "barcodes.tsv"))[[1]]) %>% 
+#   set_rownames(read.table(file.path(cm_path, "genes.tsv"))[[2]])
+#   read.table(file.path(cm_path, "barcodes.tsv"), header = F)[[1]] %>% 
+# 
+# cm <- cm[,Matrix::colSums(cm > 0) > 1000]
+# 
+# p2 <- basicP2proc(cm, n.cores=30, get.tsne=F, get.largevis=F, make.geneknn=F)
+# p2$getEmbedding(type="PCA", embeddingType="UMAP", min_dist=0.25, spread=1.5)
+# p2$getKnnClusters(type="PCA", method=conos::leiden.community, n.iterations=8, resolution=12, name="leiden")
+# readr::write_rds(p2, CachePath("merfish/p2.rds"))
+
+p2 <- CachePath("merfish/p2.rds") %>% readr::read_rds()
+clusters <- p2$clusters$PCA$leiden
+
+conos::embeddingPlot(p2$embeddings$PCA$UMAP, groups=clusters, shuffle.colors=T, font.size=c(2, 5))
+```
+
+```{r}
+cm_norm <- Matrix::t(p2$misc$rawCounts) %>% normalizeTfIdfWithFeatures()
+```
+
+```{r}
+clf_data <- getClassificationData(cm_norm, marker_path, prenormalized=T)
+# ann_by_level <- assignCellsByScores(p2$graphs$PCA, clf_data, clusters=clusters)
+ann_by_level <- assignCellsByScores(NULL, clf_data, clusters=clusters)
+
+plotAnnotationByLevels(p2$embeddings$PCA$UMAP, ann_by_level$annotation, size=0.2, font.size=c(2, 4), 
+                       shuffle.colors=T)
+```
+
+#### Inhibitory
+
+```{r}
+p2_inh <- which(ann_by_level$annotation$l1 == "Inhibitory") %>% names() %>% 
+  p2$misc$rawCounts[., ] %>% Matrix::t() %>% 
+  GetPagoda(n.cores=30, embeding.type=NULL)
+
+p2_inh$getEmbedding(type="PCA", embeddingType="UMAP", min_dist=0.25, spread=1.5)
+p2_inh$getKnnClusters(type="PCA", method=conos::leiden.community, n.iterations=8, resolution=1, name="leiden")
+```
+
+```{r}
+c("Syt2", "Sox6", "Prlr", "Pgr", "Htr2c", "Greb1", "Gda", "Gabra1", "Esr1", "Cyp19a1",
+  "Cpne5", "Calcr", "Brs3", "Baiap2", "Avpr1a", "Arhgap36", "Ar", "Ano3", "Amigo2") %>%
+plotGeneExpression(p2_inh$embeddings$PCA$UMAP, p2_inh$counts, build.panel=F)
+```
+
+#### Excitatory
+
+```{r}
+p2_ex <- which(ann_by_level$annotation$l1 == "Excitatory") %>% names() %>% 
+  p2$misc$rawCounts[., ] %>% Matrix::t() %>% 
+  GetPagoda(n.cores=30, embeding.type="UMAP")
+
+p2_ex$getEmbedding(type="PCA", embeddingType="UMAP", min_dist=0.25, spread=1.5)
+p2_ex$getKnnClusters(type="PCA", method=conos::leiden.community, n.iterations=8, resolution=1, name="leiden")
+```
+
+```{r}
+# c("Onecut2", "Nos1", "Necab1", "Fezf1", "Etv1", "Ebf3", "Cbln2", "Cbln1", "Bdnf", "Brs3", "Arhgap36") %>%
+# c("Nos1", "Bdnf", "Cbln2", "Fezf1", "Irs4", "Sema3c", "Tacr1") %>% 
+c("Necab1", "Ntng1", "Ebf3", "Cbln1", "Cbln2", "Fezf1") %>%
+  plotGeneExpression(p2_ex$embeddings$PCA$UMAP, p2$counts, build.panel=F)
+```
+
+## Patches
+
+```{r}
+library(reticulate)
+
+np <- import("numpy")
+cm <- np$load("~/mh/tmp_exchange/cur_neighb_cm_df.npy") %>% 
+  as("dgCMatrix") %>% set_colnames(paste0("c", 1:ncol(.)))
+rownames(cm) <- read.csv("~/mh/tmp_exchange/cur_neighb_cm_genes.csv")$genes
+```
+
+```{r}
+p2_patches <- GetPagoda(cm, n.pcs=20, embeding.type=NULL, distance="L2", n.cores=30, clustering.type=NULL)
+p2_patches$getEmbedding(type="PCA", embeddingType="UMAP_graph", min_dist=0.25, spread=1.5)
+p2_patches$getKnnClusters(type="PCA", method=conos::leiden.community, n.iterations=8, resolution=5, name="leiden")
+p2_patches$getKnnClusters(type="PCA", method=conos::leiden.community, n.iterations=8, resolution=1.5, name="leiden_lr")
+conos::embeddingPlot(p2_patches$embeddings$PCA$UMAP, groups=p2_patches$clusters$PCA$leiden_lr, shuffle.colors=T, font.size=c(2, 5))
+```
+
+```{r}
+c("Gad1", "Slc17a6") %>% 
+  plotGeneExpression(p2_patches$embeddings$PCA$UMAP, p2_patches$counts, build.panel=F)
+```
+
+```{r}
+clf_data <- getClassificationData(Matrix::t(p2_patches$misc$rawCounts), marker_path)
+ann_by_level <- assignCellsByScores(NULL, clf_data, clusters=p2_patches$clusters$PCA$leiden)
+# ann_by_level <- assignCellsByScores(NULL, clf_data)
+
+plotAnnotationByLevels(p2_patches$embeddings$PCA$UMAP, ann_by_level$annotation, size=0.2, font.size=c(2, 4), 
+                       shuffle.colors=T)
+```
+
+```{r}
+as.data.frame(ann_by_level$annotation) %>% tibble::as_tibble(rownames="cell") %>% 
+  cbind(cluster=p2_patches$clusters$PCA$leiden_lr) %>% 
+  readr::write_csv("~/mh/tmp_exchange/cur_neighb_cm_annot.csv")
+```
+
